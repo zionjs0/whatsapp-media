@@ -1,0 +1,161 @@
+const babel = require('@babel/core');
+
+/**
+ * convertEsmToCjs - converter sederhana berbasis regex
+ * Notasi: menangani import/export umum (default, named, namespace, side-effect),
+ *         export declarations, export list, export * from ...
+ * Limitasi: tidak 100% untuk dynamic import, re-export kompleks atau terselubung dalam template strings.
+ */
+function convertEsmToCjs(code) {
+  let out = code;
+
+  // 1) import ... from 'x'
+  // default: import foo from 'mod'  -> const foo = require('mod');
+  out = out.replace(
+    /import\s+([A-Za-z0-9_$]+)\s+from\s+(['"`][^'"`]+['"`]);?/g,
+    (m, def, mod) => `const ${def} = require(${mod});`
+  );
+
+  // 2) import { a, b as c } from 'mod'
+  out = out.replace(
+    /import\s+\{\s*([^}]+)\s*\}\s+from\s+(['"`][^'"`]+['"`]);?/g,
+    (m, list, mod) => {
+      // convert "b as c" -> "b: c"
+      const mapped = list
+        .split(',')
+        .map(s => s.trim().replace(/\s+as\s+/i, ': '))
+        .join(', ');
+      return `const { ${mapped} } = require(${mod});`;
+    }
+  );
+
+  // 3) import * as ns from 'mod'
+  out = out.replace(
+    /import\s+\*\s+as\s+([A-Za-z0-9_$]+)\s+from\s+(['"`][^'"`]+['"`]);?/g,
+    (m, name, mod) => `const ${name} = require(${mod});`
+  );
+
+  // 4) import 'side-effect';
+  out = out.replace(/import\s+(['"`][^'"`]+['"`]);?/g, (m, mod) => `require(${mod});`);
+
+  // 5) export default <expr|function|class>
+  // handle "export default function name(...) { ... }" and "export default class Name {...}"
+  out = out.replace(/export\s+default\s+function\s+([A-Za-z0-9_$]*)/g, (m, name) => {
+    if (name) return `function ${name}`;
+    return 'module.exports = function';
+  });
+  out = out.replace(/export\s+default\s+class\s+([A-Za-z0-9_$]*)/g, (m, name) => {
+    if (name) return `class ${name}`;
+    return 'module.exports = class';
+  });
+  // generic default export (expression)
+  out = out.replace(/export\s+default\s+/g, 'module.exports = ');
+
+  // 6) export const/let/var name = ...
+  // Keep declaration, and append exports.name = name;
+  out = out.replace(/export\s+(const|let|var)\s+([A-Za-z0-9_$]+)\s*=/g, (m, kind, name) => {
+    return `${kind} ${name} =`;
+  });
+  // After declarations, add mapping for exported vars (simple heuristic)
+  // Find exported var/let/const names and append export lines at end of file if not already exported
+  const exportVars = [];
+  const varRegex = /(?:^|\n)\s*(?:const|let|var)\s+([A-Za-z0-9_$]+)\s*=/g;
+  let match;
+  // Collect variable names that were originally exported by looking for preceding "export " in original code
+  const originalExportVarRegex = /export\s+(?:const|let|var)\s+([A-Za-z0-9_$]+)\s*=/g;
+  while ((match = originalExportVarRegex.exec(code))) {
+    exportVars.push(match[1]);
+  }
+
+  if (exportVars.length) {
+    const exportLines = exportVars.map(n => `exports.${n} = ${n};`).join('\n');
+    out += '\n\n' + exportLines + '\n';
+  }
+
+  // 7) export { a, b as c }
+  out = out.replace(/export\s*\{\s*([^}]+)\s*\}\s*;?/g, (m, list) => {
+    return list
+      .split(',')
+      .map(item => {
+        const part = item.trim();
+        const asMatch = part.match(/^([A-Za-z0-9_$]+)\s+as\s+([A-Za-z0-9_$]+)$/i);
+        if (asMatch) return `exports.${asMatch[2]} = ${asMatch[1]};`;
+        return `exports.${part} = ${part};`;
+      })
+      .join('\n');
+  });
+
+  // 8) export * from 'module'
+  out = out.replace(/export\s+\*\s+from\s+(['"`][^'"`]+['"`]);?/g, (m, mod) => {
+    return `Object.assign(exports, require(${mod}));`;
+  });
+
+  // 9) export function / class declarations: export function foo() {} -> function foo() {} ; exports.foo = foo;
+  out = out.replace(/export\s+function\s+([A-Za-z0-9_$]+)\s*\(/g, (m, name) => {
+    return `function ${name}(`;
+  });
+  // collect those and append exports for them
+  const exportedFuncs = [];
+  const funcRegex = /export\s+function\s+([A-Za-z0-9_$]+)\s*\(/g;
+  while ((match = funcRegex.exec(code))) exportedFuncs.push(match[1]);
+  if (exportedFuncs.length) {
+    out += '\n\n' + exportedFuncs.map(n => `exports.${n} = ${n};`).join('\n') + '\n';
+  }
+
+  // 10) clean up multiple blank lines
+  out = out.replace(/\n{3,}/g, '\n\n');
+
+  return out;
+}
+
+async function convertWithBabel(sourceCode) {
+  const result = await babel.transformAsync(sourceCode, {
+    plugins: ['@babel/plugin-transform-modules-commonjs'],
+    sourceType: 'module',
+    configFile: false,
+    babelrc: false,
+  });
+  return result.code;
+}
+
+case 'esm2cjs':
+case 'esm2cjsfile': {
+  // ambil teks dari quoted atau teks command
+  const q = m.quoted ? m.quoted : m;
+  const text = (q.msg && (q.msg.text || q.msg.caption)) || q.text || '';
+  if (!text) return reply('Kirim/quote kode ESM yang ingin di-convert.');
+
+  try {
+    // pilih method: quick atau babel
+    const useBabel = false; // ganti ke true kalau mau pakai Babel (pastikan dep terinstall)
+    let converted;
+
+    if (useBabel) {
+      // jika pakai Babel, pastikan require('@babel/core') tersedia
+      const babel = require('@babel/core');
+      const res = await babel.transformAsync(text, {
+        plugins: ['@babel/plugin-transform-modules-commonjs'],
+        sourceType: 'module',
+        configFile: false,
+        babelrc: false,
+      });
+      converted = res.code;
+    } else {
+      // pakai converter regex sederhana
+      converted = convertEsmToCjs(text); // dari fungsi di atas
+    }
+
+    // kirim hasil sebagai file .cjs agar rapi
+    const buffer = Buffer.from(converted, 'utf8');
+    await sock.sendMessage(m.chat, {
+      document: buffer,
+      fileName: 'converted.cjs',
+      mimetype: 'text/javascript'
+    }, { quoted: m });
+
+  } catch (err) {
+    console.error(err);
+    reply('Gagal convert: ' + err.message);
+  }
+  break;
+}
